@@ -15,6 +15,8 @@ curl -fsSL https://raw.githubusercontent.com/chennian080403/gbc/main/install.sh 
 
 它会把 gbc 装到 `~/bin`，补好 PATH，然后跑 `gbc doctor`。按 ❌ 后面的提示修，修到全部 ✅，再跑 `gbc doctor --full` 实测一轮。配置写在 `~/.config/gbc/config.zsh`，有哪些变量见 `gbc` 不带参数时打印的说明。
 
+**建 bot**：[`终端遥控-Grok Bot设定.md`](终端遥控-Grok%20Bot设定.md) 是 Grok Bot 那头的设定，包括简介、11 条规则、第一次上手的自检引导、上下文满了怎么换代。把它整份发给你的 Grok Bot（或者让大管家照着建一个），它会带你装好 gbc，然后就能派活了。
+
 **怎么用**
 
 | 要做什么 | 命令（bot 替你跑） |
