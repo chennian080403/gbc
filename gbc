@@ -1,43 +1,62 @@
 #!/bin/zsh
-# gbc：给 Grok Bot 用的「前台 Claude 会话」遥控器。
-# 一次调用完成 发话 → 等 Claude 做完 → 取回回复，省掉多轮来回。
+# gbc：给 Grok Bot 用的「前台 AI 终端会话」遥控器，后端可以是 Claude Code 或 Kimi Code。
+# 一次调用完成 发话 → 等它做完 → 取回回复，省掉多轮来回。
 #
-#   gbc open [目录] [启动命令]   开 screen 会话并弹出 Terminal 窗口给人看（默认 ~/Documents、$GBC_LAUNCH 或 claude）
-#   gbc send "文字" [最长等待秒]  发一条消息；等到 Claude 做完或超时（默认 60 秒），打印它的回复
+#   gbc open [目录] [启动命令]   开 screen 会话并弹出 Terminal 窗口给人看（默认 ~/Documents）
+#   gbc send "文字" [最长等待秒]  发一条消息；等到做完或超时（默认 600 秒），打印回复。会话没开会先自动开
 #   gbc send -n "文字"           只发不等，立刻返回
-#   gbc reply [条数]             打印 Claude 最近的回复（默认最近 1 轮）
-#   gbc wait [最长等待秒]         等 Claude 当前这一轮做完再打印回复
-#   gbc busy                     Claude 在干活输出 yes，空闲输出 no
-#   gbc esc                      按一次 Esc（打断 Claude）
+#   gbc send -i "文字" [秒]      插话：它正在干活也直接打进去（不等这一轮做完），再等这一轮做完
+#   gbc key 按键… [-n]           在确认框里替人按键：1 2 3…、enter、esc、tab、up、down、space；按完等这一轮做完
+#   gbc reply [-v] [条数]        打印最近的回复（默认最近 1 轮；-v 连每次工具调用都列出）
+#   gbc wait [最长等待秒]         等当前这一轮做完再打印回复
+#   gbc busy                     在干活输出 yes，空闲输出 no，在等人选输出 ask
+#   gbc ls                       列出所有 gb 开头的会话：后端、目录、状态、上下文
+#   gbc esc                      按一次 Esc（打断）
 #   gbc show                     重新弹出 Terminal 窗口挂上会话
 #   gbc close                    结束会话
-#   gbc ctx                      打印本会话上下文占比（窗口按 100 万 token 算）
-#   gbc jj                       交接换新对话：写交接 → /clear → 让新对话读交接接着干
-#   gbc cl A jj                  额度用完的应急：用 A 号额度写交接、切到 A 号新对话并接着干（B 号同理；要 GBC_CL=1）
-#   gbc cl A                     只切到 A 号开空白新对话
+#   gbc ctx                      打印本会话上下文占比
+#   gbc jj                       交接换新对话：写交接 → 清空对话 → 让新对话读交接接着干
+#   gbc cl A jj                  （仅 Claude）额度用完的应急：用 A 号额度写交接、切到 A 号新对话并接着干（要 GBC_CL=1）
+#   gbc cl A                     （仅 Claude）只切到 A 号开空白新对话
 #   gbc doctor [--full]          自检装好没有；--full 另开临时会话实测一轮收发
 #   gbc version                  打印版本
-# send 这一轮做完时，上下文到 GBC_CTX_LIMIT（默认 28）% 就自动 gbc jj，全在脚本里算，不经过任何模型；
+#
+# 选后端：命令前加 --kimi 或 --claude（如 gbc --kimi send "…"），不加就用 GBC_AGENT（默认 claude）。
+# 会话名默认 gb-claude / gb-kimi，可用 GBC_SESSION 改；会话开着时，以开它时用的后端为准。
+# send/wait/key 遇到确认框（要批准、要选一项）会立刻返回题目和选项，退出码 3，等人选了再 gbc key。
+# 这一轮做完时，上下文到 GBC_CTX_LIMIT（默认 28）% 就自动 gbc jj，全在脚本里算，不经过任何模型；
 # 不想自动换就设 GBC_AUTO_JJ=0，只在结果末尾提示。
-# 会话名可用环境变量 GBC_SESSION 改，默认 gb-claude。
-# 系统自带的 screen 4.00 截屏会丢中文，所以回复内容读 Claude 的对话记录，屏幕只用来判断忙不忙。
+# 系统自带的 screen 4.00 截屏会丢中文，所以回复内容读对话记录，屏幕只用来判断忙不忙、有没有确认框。
 #
 # 配置（环境变量，或写进 ~/.config/gbc/config.zsh，每次运行都会读）：
-#   GBC_LAUNCH       开会话的启动命令，默认 claude
-#   GBC_JJ_CMD       交接脚本，收一个会话 id、输出「交接文件：<路径>（…」；不设就让 Claude 自己写交接
+#   GBC_AGENT        默认后端，claude 或 kimi
+#   GBC_LAUNCH       Claude 的启动命令，默认 claude
+#   GBC_KIMI_LAUNCH  Kimi 的启动命令，默认 kimi
+#   GBC_JJ_CMD       Claude 的交接脚本，收一个会话 id、输出「交接文件：<路径>（…」；不设就让它自己写交接
 #   GBC_HANDOFF_DIR  内置交接写到哪，默认 ~/交接
 #   GBC_CL           装了多号接力（/cla /clb）才设 1
-#   GBC_CTX_WINDOW   模型上下文窗口 token 数，默认 1000000；20 万窗口的模型要设 200000
+#   GBC_CTX_WINDOW   Claude 的上下文窗口 token 数，默认 1000000；20 万窗口的模型要设 200000（Kimi 直接读它底栏的占比）
 #   GBC_CTX_LIMIT    自动交接的占比线，默认 28
 #   GBC_PROJECTS     Claude 对话记录目录，默认 $CLAUDE_CONFIG_DIR/projects 或 ~/.claude/projects
+#   GBC_KIMI_HOME    Kimi 数据目录，默认 ~/.kimi-code
+#   GBC_DOCTOR_DIR   doctor --full 在哪个目录实测，默认 ~/Documents
 
-GBC_VERSION=1.0
+GBC_VERSION=2.0
 CONF=${GBC_CONFIG:-$HOME/.config/gbc/config.zsh}
 [[ -f $CONF ]] && source "$CONF"
 export GBC_PROJECTS=${GBC_PROJECTS:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects}
-S=${GBC_SESSION:-gb-claude}
+export GBC_KIMI_HOME=${GBC_KIMI_HOME:-$HOME/.kimi-code}
+AG=
+[[ $1 == --(kimi|claude) ]] && { AG=${1#--}; shift }
+[[ $1 == open && $2 == --(kimi|claude) ]] && { AG=${2#--}; set -- open "${@:3}" }
+AG=${AG:-${GBC_AGENT:-claude}}
+S=${GBC_SESSION:-gb-$AG}
 TMP=${TMPDIR:-/tmp}/gbc.$S
 mkdir -p "$TMP"
+# 会话开着时，以开它时记下的后端为准
+[[ -s $TMP/agent ]] && screen -ls 2>/dev/null | grep -q "[0-9]\.${S}[[:space:]]" && AG=$(<$TMP/agent)
+export GBC_AG=$AG
+[[ $AG == kimi ]] && NAME=Kimi || NAME=Claude
 DIR=$(cat "$TMP/dir" 2>/dev/null || echo "$HOME/Documents")
 
 alive() { screen -ls 2>/dev/null | grep -q "[0-9]\.${S}[[:space:]]" }
@@ -47,23 +66,36 @@ snap() {
   rm -f "$TMP/screen"
   screen -S "$S" -p 0 -X hardcopy "$TMP/screen" 2>/dev/null
   sleep 0.05
-  { LC_ALL=C tr -c '\n -~' ' ' < "$TMP/screen" } 2>/dev/null
+  # 去掉空行：窗口拉高时内容在上半截，下面全是空行，只看最后几行会漏
+  { LC_ALL=C tr -c '\n -~' ' ' < "$TMP/screen" | grep -v '^ *$' } 2>/dev/null
 }
 
-# 忙的时候底部有「Tinkering… (16s)」这种动词进度行（… 截屏后变成 &），老版本是 esc to interrupt
-is_busy() { snap | tail -n 15 | grep -qE '^.? ?[A-Z][a-z]+ing(&|\.\.\.)?( \(|$)|esc to interrupt' }
-# 输入框底栏出来了、且不在忙，才算能收消息（刚启动时既不忙也没就绪）
-is_ready() { local s=$(snap | tail -n 15); print -r -- "$s" | grep -qE 'shift\+tab to cycle|for shortcuts' && ! print -r -- "$s" | grep -qE '^.? ?[A-Z][a-z]+ing(&|\.\.\.)?( \(|$)' }
-# 新目录第一次开 Claude 会问信不信任这个目录。默认选项不一定是「信任」，不能替人按回车，只提示
-is_trust() { snap | grep -qE 'trust (the files in )?this folder|Yes, proceed|Yes, I trust' }
+# 忙：Claude 底部有「Tinkering… (16s)」这种动词进度行（… 截屏后变成 &），老版本是 esc to interrupt；
+# Kimi 是「Working…」，跑命令时有「Running a command」、输入框上方有一行 Tip（底栏右边的 ctrl+c: cancel 是轮播提示，闲时也有，不能用）
+if [[ $AG == kimi ]]; then
+  BUSY_RE='(^| )[A-Z][a-z]+ing(&|\.\.\.)( |$)|^ +Tip: |Running a command'
+  READY_RE='context: [0-9]+%'
+else
+  BUSY_RE='^.? ?[A-Z][a-z]+ing(&|\.\.\.)?( \(|$)|esc to interrupt'
+  READY_RE='shift\+tab to cycle|for shortcuts|mode on'
+fi
+# 确认框：Claude 底部是「Esc to cancel」，Kimi 是「esc cancel」
+ASK_RE='[Ee]sc (to )?cancel'
+is_busy() { snap | tail -n 15 | grep -qE "$BUSY_RE" }
+is_asking() { snap | tail -n 8 | grep -qE "$ASK_RE" }
+# 输入框底栏出来了、不在忙、没有确认框，才算能收消息（刚启动时既不忙也没就绪）
+is_ready() { local s=$(snap | tail -n 15); print -r -- "$s" | grep -qE "$READY_RE" && ! print -r -- "$s" | grep -qE "$BUSY_RE" && ! print -r -- "$s" | tail -n 8 | grep -qE "$ASK_RE" }
+# 新目录第一次开会问信不信任这个目录。默认选项不一定是「信任」，不能替人按回车，只提示
+is_trust() { snap | grep -qiE 'trust (the files in )?this folder|Yes, proceed|Yes, I trust' }
 wait_ready() {
   local i
   for i in {1..120}; do
     is_ready && return 0
-    is_trust && { echo "—— Claude 在问信不信任这个目录：到终端窗口选「Yes, I trust this folder」，再重发 ——"; return 1 }
+    is_trust && { echo "—— $NAME 在问信不信任这个目录：到终端窗口选信任（Yes, I trust / Trust and continue），再重发 ——"; return 1 }
+    if is_asking; then sleep 0.3; is_asking && { show_ask; return 3 }; fi
     sleep 0.25
   done
-  echo "—— 30 秒内 Claude 没就绪，先 gbc show 看一眼 ——"; return 1
+  echo "—— 30 秒内 $NAME 没就绪，先 gbc show 看一眼 ——"; return 1
 }
 # 从别的 Claude 会话里继承来的这些变量会让新 Claude 不存对话记录，开会话前去掉
 CLEAN_ENV=(-u CLAUDECODE -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_MESSAGING_SOCKET -u CLAUDE_CODE_MESSAGING_TOKEN -u CLAUDE_CODE_EXECPATH -u CLAUDE_CODE_SESSION_ATTENDED -u CLAUDE_PID -u CLAUDE_EFFORT -u AI_AGENT)
@@ -72,99 +104,185 @@ show_window() {
   osascript -e "tell application \"Terminal\" to do script \"screen -x $S\"" -e 'tell application "Terminal" to activate' >/dev/null
 }
 
-# 读本会话的对话记录：第一次发话后按「含这句原文」找到自己的那份并记下，同目录开着别的 Claude 也不会读错
-# since（毫秒）非空就取那之后的轮次，否则取最近 n 轮
+# Kimi 的上下文占比直接读它底栏「context: 4% (29.7k/977k)」
+kimi_pct() { snap | grep -oE 'context: [0-9]+%' | tail -1 | grep -oE '[0-9]+' }
+
+# 读本会话的对话记录：第一次发话后按「含这句原文、且发在这次 send 之后」找到自己的那份并记下，同目录开着别的会话也不会读错
+# since（毫秒）非空就取那之后的轮次，否则取最近 n 轮；mode：done 只判断做完没有，ctx 只打占比，ask 打印正在等人回答的确认框，v 列出每次工具调用
 get_reply() {
+  [[ $AG == kimi ]] && export GBC_PCT=$(kimi_pct)
   python3 - "$DIR" "${1:-}" "${2:-1}" "$TMP/file" "$TMP/msg" "${3:-}" <<'EOF'
 import json, os, re, sys, glob, datetime
 d, since, n, keep, msgf, mode = sys.argv[1:7]
-n = int(n)
-proj = os.path.join(os.path.expanduser(os.environ['GBC_PROJECTS']), re.sub(r'[^A-Za-z0-9]', '-', os.path.realpath(d)))
+n = int(n); kimi = os.environ.get('GBC_AG') == 'kimi'
+def iso_ms(ts): return int(datetime.datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp() * 1000) if ts else 0
+def prompt_text(o):
+    if kimi: return ''.join(p.get('text', '') for p in o.get('input') or [] if p.get('type') == 'text')
+    return (o.get('message') or {}).get('content')
 f = open(keep).read().strip() if os.path.exists(keep) else ''
 if not os.path.exists(f):
     msg = open(msgf, encoding='utf-8').read() if os.path.exists(msgf) else ''
+    if kimi:
+        home = os.path.expanduser(os.environ['GBC_KIMI_HOME']); rd = os.path.realpath(d); cands = []
+        for line in open(os.path.join(home, 'session_index.jsonl'), encoding='utf-8') if os.path.exists(os.path.join(home, 'session_index.jsonl')) else []:
+            try: o = json.loads(line)
+            except Exception: continue
+            w = os.path.join(o.get('sessionDir', ''), 'agents', 'main', 'wire.jsonl')
+            if os.path.realpath(o.get('workDir', '')) == rd and os.path.exists(w): cands.append(w)
+        key, tsof = '"turn.prompt"', lambda o: o.get('time', 0)
+    else:
+        cands = glob.glob(os.path.join(os.path.expanduser(os.environ['GBC_PROJECTS']), re.sub(r'[^A-Za-z0-9]', '-', os.path.realpath(d))) + '/*.jsonl')
+        key, tsof = '"user"', lambda o: iso_ms(o.get('timestamp', ''))
     # 同一句话可能在别的会话里发过，所以要「原文相同且发在这次 send 之后」
     def mine(c):
         for line in open(c, encoding='utf-8'):
-            if msg and '"user"' in line and json.dumps(msg, ensure_ascii=False)[1:-1] in line:
-                o = json.loads(line); ts = o.get('timestamp', '')
-                if (o.get('message') or {}).get('content') == msg and ts and since and \
-                   datetime.datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp() * 1000 >= int(since) - 2000:
-                    return True
+            if msg and key in line and json.dumps(msg, ensure_ascii=False)[1:-1] in line:
+                o = json.loads(line)
+                if prompt_text(o) == msg and since and tsof(o) >= int(since) - 2000: return True
         return False
-    cands = sorted(glob.glob(proj + '/*.jsonl'), key=os.path.getmtime, reverse=True)
+    cands = sorted(set(cands), key=os.path.getmtime, reverse=True)
     f = next((c for c in cands[:20] if mine(c)), '')
-    if not f: sys.exit(1 if mode else print('（还没找到本会话的对话记录，Claude 可能还没收到这条）'))
+    if not f: sys.exit({'done': 4, 'ask': 1, 'ctx': 1}.get(mode) or print('（还没找到本会话的对话记录，可能还没收到这条）'))
     open(keep, 'w').write(f)
-turns, cur, ctx = [], None, 0
+turns, cur, ctx, pend, asks, done_ids = [], None, 0, {}, {}, set()
+def new_turn(ms, ask):
+    global cur; cur = {'ms': ms, 'ask': ask, 'say': [], 'tools': 0, 'done': False}; turns.append(cur)
 for line in open(f, encoding='utf-8'):
     try: o = json.loads(line)
     except Exception: continue
-    ts = o.get('timestamp')
-    ms = int(datetime.datetime.fromisoformat(ts.replace('Z', '+00:00')).timestamp() * 1000) if ts else 0
+    t = o.get('type')
+    if kimi:
+        ms = o.get('time', 0)
+        if t == 'turn.prompt' and (o.get('origin') or {}).get('kind') == 'user':
+            new_turn(ms, prompt_text(o)); pend.clear(); asks.clear()
+        elif t == 'turn.ended' and cur is not None: cur['done'] = True
+        elif t == 'interaction.request': asks[o.get('id')] = o
+        elif t == 'interaction.resolved': asks.pop(o.get('id'), None)
+        elif t == 'context.append_loop_event' and cur is not None:
+            e = o.get('event') or {}; et = e.get('type'); p = e.get('part') or {}
+            if et == 'content.part' and p.get('type') == 'text' and p.get('text', '').strip(): cur['say'].append(p['text'].strip())
+            elif et == 'tool.call':
+                cur['tools'] += 1; cur['say'].append('［调用 %s］' % e.get('name'))
+        continue
+    ms = iso_ms(o.get('timestamp'))
     m = o.get('message') or {}
-    if o.get('type') == 'user' and isinstance(m.get('content'), str) and not m['content'].lstrip().startswith(('<local-command', '<command-')):
-        cur = {'ms': ms, 'ask': m['content'], 'say': [], 'done': False}; turns.append(cur)
+    if t == 'user' and isinstance(m.get('content'), str) and not m['content'].lstrip().startswith(('<local-command', '<command-')):
+        new_turn(ms, m['content']); pend.clear()
+    elif t == 'user' and isinstance(m.get('content'), list):
+        for c in m['content']:
+            if isinstance(c, dict) and c.get('type') == 'tool_result': pend.pop(c.get('tool_use_id'), None); done_ids.add(c.get('tool_use_id'))
     elif o.get('subtype') == 'turn_duration' and cur is not None:
         cur['done'] = True
-    elif o.get('type') == 'assistant' and cur is not None:
+    elif t == 'assistant' and cur is not None:
         u = m.get('usage') or {}
         ctx = u.get('input_tokens', 0) + u.get('cache_read_input_tokens', 0) + u.get('cache_creation_input_tokens', 0) or ctx
         for c in m.get('content') or []:
             if c.get('type') == 'text' and c['text'].strip(): cur['say'].append(c['text'].strip())
-            elif c.get('type') == 'tool_use': cur['say'].append('［调用 %s］' % c.get('name'))
+            elif c.get('type') == 'tool_use':
+                cur['tools'] += 1; cur['say'].append('［调用 %s］' % c.get('name')); pend[c.get('id')] = c
+pct = float(os.environ['GBC_PCT']) if kimi and os.environ.get('GBC_PCT') else ctx * 100 / int(os.environ.get('GBC_CTX_WINDOW') or 1000000)
+if mode == 'ctx': sys.exit(print('%.0f' % pct) if not kimi or os.environ.get('GBC_PCT') else 1)
+if mode == 'ask':
+    # 打印正在等人回答的那一问：提问给出题目和编号选项，要批准的给出要做的事；屏幕上的选项行由调用方补
+    def opts(qs):
+        for q in qs:
+            print('问：' + q.get('question', ''))
+            for i, op in enumerate(q.get('options') or [], 1):
+                print('  %d. %s%s' % (i, op.get('label', ''), ' —— ' + op['description'] if op.get('description') else ''))
+            print('  （也可以 gbc key esc 取消，或让 %s 换个问法）' % ('Kimi' if kimi else 'Claude'))
+    if kimi:
+        if not asks: sys.exit(1)
+        o = list(asks.values())[-1]; r = o.get('request') or {}
+        if o.get('kind') == 'question': opts(r.get('questions') or []); sys.exit(0)
+        dp = r.get('display') or {}
+        print('要批准：%s %s' % (r.get('toolName', ''), dp.get('command') or r.get('action', '')))
+        if dp.get('plan'): print(dp['plan'][:1500])
+        sys.exit(2)
+    qf = os.path.join(os.path.dirname(keep), 'askq.json')
+    if os.path.exists(qf):
+        try: h = json.load(open(qf, encoding='utf-8'))
+        except Exception: h = {}
+        if h.get('tool_use_id') and h['tool_use_id'] not in done_ids:
+            pend[h['tool_use_id']] = {'name': h.get('tool_name'), 'input': h.get('tool_input') or {}}
+    if not pend: sys.exit(1)
+    c = list(pend.values())[-1]; i = c.get('input') or {}
+    if c.get('name') == 'AskUserQuestion': opts(i.get('questions') or []); sys.exit(0)
+    print('要批准：%s %s' % (c.get('name'), i.get('command') or i.get('file_path') or i.get('url') or i.get('pattern') or ''))
+    if i.get('plan'): print(i['plan'][:1500])
+    sys.exit(2)
 pick = [t for t in turns if t['ms'] >= int(since) - 2000] if since else turns[-n:]
-pct = ctx * 100 / int(os.environ.get('GBC_CTX_WINDOW') or 1000000)
-if mode == 'ctx': sys.exit(print('%.0f' % pct))
-if mode: sys.exit(0 if pick and pick[-1]['done'] else 1)
+if mode == 'done': sys.exit(0 if pick and pick[-1]['done'] else 1)
 for t in pick:
-    print('▶ 发：' + t['ask'][:200])
-    print('\n'.join(t['say']) or '（还没有回复）')
+    print('▶ 发：' + t['ask'][:80])
+    say = t['say'] if mode == 'v' else [s for s in t['say'] if not s.startswith('［调用 ')]
+    print('\n'.join(say) or ('（还没有回复）' if t['done'] or not t['tools'] else ''))
+    if t['tools'] and mode != 'v': print('（中间用了 %d 次工具%s）' % (t['tools'], '' if t['done'] else '，还在做'))
     print()
-print('［上下文 %.0f%%］' % pct)
+if not kimi or os.environ.get('GBC_PCT'): print('［上下文 %.0f%%］' % pct)
 EOF
 }
 
-# 以对话记录里这一轮的 turn_duration 为准；屏幕判断只做兜底（先忙过、再闲 1 秒）
+# 打印确认框：题目和选项从对话记录里取（中文不丢），要批准的再补上屏幕上的选项行
+show_ask() {
+  echo "—— $NAME 在等你选：念给主人，他选了再 gbc key <编号>（取消用 gbc key esc）——"
+  # 框弹出来时，对话记录可能还没写到这一条，等一会儿再退回读屏幕
+  local rc i
+  for i in {1..12}; do
+    get_reply "" 1 ask 2>/dev/null; rc=$?
+    (( rc != 1 )) && break; sleep 0.25
+  done
+  if (( rc != 0 )); then
+    snap | tail -n 12 | grep -E '^ *.{0,2} ?(\[[0-9]\]|[0-9]\.) ' | sed 's/^ *[^ 0-9[]* \{0,1\}/  /'
+  fi
+}
+
+# 以对话记录里这一轮的结束标记为准；找不到记录时才用屏幕兜底（先忙过、再闲 2 秒）；中途出确认框就返回 3
 wait_done() {
-  local max=$1 since=$2 t=0 seen=0 idle=0
+  local max=$1 since=$2 t=0 seen=0 idle=0 ask=0 rc=4
   while (( t < max * 10 )); do
-    [[ -n $since ]] && get_reply "$since" 1 done 2>/dev/null && { get_reply "$since"; return 0 }
-    if is_busy; then seen=1; idle=0
+    if [[ -n $since ]]; then
+      get_reply "$since" 1 done 2>/dev/null; rc=$?
+      (( rc == 0 )) && { get_reply "$since"; return 0 }
+    fi
+    if is_asking; then
+      (( ++ask >= 2 )) && { get_reply "$since"; show_ask; return 3 }
+    elif is_busy; then seen=1; idle=0; ask=0
     else
-      (( idle++ ))
-      (( seen && idle >= 4 )) && { get_reply "$since"; return 0 }
+      (( idle++ )); ask=0
+      (( rc == 4 && seen && idle >= 8 )) && { get_reply "$since"; return 0 }
     fi
     sleep 0.25; (( t += 3 ))
   done
   get_reply "$since"
-  echo "—— 等了 ${max} 秒 Claude 还在干，稍后 gbc wait 或 gbc reply ——"
+  echo "—— 等了 ${max} 秒 $NAME 还在干，稍后 gbc wait 或 gbc reply ——"
   return 1
 }
 
-# 写交接 → /clear → 让新对话读交接接着干
+# 写交接 → 清空对话 → 让新对话读交接接着干
 do_jj() {
   local f out h
   f=$(cat "$TMP/file" 2>/dev/null); [[ -f $f ]] || { echo "本会话还没发过话，没有可交接的记录"; return 1 }
   echo "写交接中（约 1 分钟）…"
-  if [[ -n $GBC_JJ_CMD ]]; then
+  if [[ -n $GBC_JJ_CMD && $AG == claude ]]; then
     out=$(env $CLEAN_ENV ${~GBC_JJ_CMD} "${f:t:r}" 2>&1)
     h=$(print -r -- "$out" | sed -n 's/^交接文件：\(.*\)（.*/\1/p' | tail -1)
   else
-    # 没有交接脚本：让 Claude 自己写到指定路径，写没写成看文件在不在
+    # 没有交接脚本：让它自己写到指定路径，写没写成看文件在不在
     local hd=${~GBC_HANDOFF_DIR:-$HOME/交接}
     mkdir -p "$hd"; h=$hd/$(date +%Y-%m-%d-%H%M)-gbc-$S.md
     local s0=$(now_ms)
-    type_line "上下文快满了，要换新对话。请把交接写到 $h ：先读哪些文件、硬约束、现状、按顺序的待办（每条写清怎么做、怎么验收），让新对话看着就能直接开干。写完只回这个路径。"
+    type_line "上下文快满了，要换新对话。请把交接写到 $h ，只按本对话里做过的事写，不要去翻别的会话或文件补内容：先读哪些文件、硬约束、现状、按顺序的待办（每条写清怎么做、怎么验收），让新对话看着就能直接开干。写完只回这个路径。"
     out=$(wait_done 300 "$s0")
   fi
   [[ -f $h ]] || { print -r -- "$out" | tail -5; echo "交接没写成，没有清空对话"; return 1 }
   echo "交接文件：$h"
-  type_line "/clear"; sleep 1.5; wait_ready || return 1
+  [[ $AG == kimi ]] && type_line "/new" || type_line "/clear"
+  sleep 1.5; wait_ready || return 1
   rm -f "$TMP/file"
   local since=$(now_ms)
   type_line "请读 $h ，按里面的交接方案继续做。"
-  wait_done "${1:-120}" "$since"
+  print -r -- "$since" > "$TMP/since"
+  wait_done "${1:-600}" "$since"
 }
 
 # 这一轮做完且上下文到线，就自动交接
@@ -178,40 +296,88 @@ auto_jj() {
 
 now_ms() { python3 -c 'import time;print(int(time.time()*1000))' }
 
-# 粘贴一段文字并回车；走 screen 的寄存器粘贴，中文和特殊字符不会被 stuff 转义吃掉
+# 粘贴一段文字并回车；走 screen 的寄存器粘贴，中文和特殊字符不会被 stuff 转义吃掉。
+# Kimi 要包上括号粘贴标记，不然文字里的路径会弹出补全框，吞掉回车还往末尾塞东西
 type_line() {
   print -rn -- "$1" > "$TMP/msg"
   screen -S "$S" -p 0 -X readreg p "$TMP/msg"
+  [[ $AG == kimi ]] && screen -S "$S" -p 0 -X stuff $'\e[200~'
   screen -S "$S" -p 0 -X paste p
+  [[ $AG == kimi ]] && screen -S "$S" -p 0 -X stuff $'\e[201~'
   sleep 0.2
   screen -S "$S" -p 0 -X stuff $'\r'
 }
 
+do_open() {
+  local dir=${1:-$DIR} cmd
+  [[ $AG == kimi ]] && cmd=${2:-${GBC_KIMI_LAUNCH:-kimi}} || cmd=${2:-${GBC_LAUNCH:-claude}}
+  if alive; then echo "会话 $S 已存在，直接挂窗口"; else
+    rm -f "$TMP/file" "$TMP/since"
+    # Claude 弹提问框时，那一问要等回答完才写进对话记录；加一个只对本会话生效的钩子，先把题目抄到临时目录
+    [[ $AG == claude && -z $2 && ${GBC_ASK_HOOK:-1} == 1 ]] && {
+      print -r -- '{"hooks":{"PreToolUse":[{"matcher":"AskUserQuestion|ExitPlanMode","hooks":[{"type":"command","command":"cat > '"$TMP"'/askq.json"}]}]}}' > "$TMP/hook.json"
+      cmd+=" --settings ${(q)TMP}/hook.json" }
+    env $CLEAN_ENV screen -U -dmS "$S" zsh -ic "cd ${(q)dir} && $cmd; exec zsh -i"
+    print -r -- "$dir" > "$TMP/dir"; print -r -- "$AG" > "$TMP/agent"; DIR=$dir
+  fi
+  show_window
+  wait_ready && echo "已开：会话 $S（$NAME），目录 $dir，已就绪"
+}
+
+# 按键名换成要发的字符
+keycode() {
+  case ${1:l} in
+    enter) print -n $'\r' ;; esc) print -n $'\e' ;; tab) print -n $'\t' ;; space) print -n ' ' ;;
+    up) print -n $'\e[A' ;; down) print -n $'\e[B' ;; left) print -n $'\e[D' ;; right) print -n $'\e[C' ;;
+    *) print -rn -- "$1" ;;
+  esac
+}
+
 case $1 in
-  open)
-    dir=${2:-$HOME/Documents}; cmd=${3:-${GBC_LAUNCH:-claude}}
-    if alive; then echo "会话 $S 已存在，直接挂窗口"; else
-      rm -f "$TMP/file"
-      env $CLEAN_ENV screen -U -dmS "$S" zsh -ic "cd ${(q)dir} && $cmd; exec zsh -i"
-      print -r -- "$dir" > "$TMP/dir"
-    fi
-    show_window
-    wait_ready && echo "已开：会话 $S，目录 $dir，Claude 已就绪" ;;
+  open) shift; do_open "$@" ;;
   send)
-    need; nowait=0
+    nowait=0 inter=0
     [[ $2 == -n ]] && { nowait=1; shift }
-    text=$2; max=${3:-60}
-    [[ -z $text ]] && { echo "用法：gbc send \"文字\""; exit 1 }
-    wait_ready || exit 1
-    since=$(now_ms)
+    [[ $2 == -i ]] && { inter=1; shift }
+    text=$2; max=${3:-600}
+    [[ -z $text ]] && { echo "用法：gbc send [-n|-i] \"文字\" [最长等待秒]"; exit 1 }
+    if ! alive; then
+      (( inter )) && { echo "没有名为 $S 的会话，没法插话"; exit 1 }
+      echo "（会话 $S 没开，先在 $DIR 开好）"; do_open "$DIR" || exit 1
+    fi
+    if (( inter )) && ! is_ready; then
+      is_asking && { show_ask; exit 3 }
+      type_line "$text"
+      echo "已插话，$NAME 会在这一轮里接着处理"
+      since=$(cat "$TMP/since" 2>/dev/null)
+      wait_done "$max" "$since"; exit $?
+    fi
+    wait_ready; rc=$?; (( rc )) && exit $rc
+    since=$(now_ms); print -r -- "$since" > "$TMP/since"
     type_line "$text"
     (( nowait )) && { echo "已发出"; exit 0 }
-    wait_done "$max" "$since" && auto_jj ;;
-  wait)  need; wait_done "${2:-120}" "" ;;
-  reply) get_reply "" "${2:-1}" ;;
-  ctx)   need; get_reply "" 1 ctx ;;
-  jj)    need; wait_ready && do_jj "${2:-120}" ;;
+    wait_done "$max" "$since"; rc=$?
+    (( rc == 0 )) && auto_jj; exit $rc ;;
+  key)
+    need; shift; nowait=0
+    [[ ${@[-1]} == -n ]] && { nowait=1; set -- "${@[1,-2]}" }
+    (( $# )) || { echo "用法：gbc key 1 | enter | esc | tab | up | down … [-n]"; exit 1 }
+    # 没有确认框时按键会打进输入框，所以只在框开着时按；按 esc 打断不受限
+    [[ $* == esc ]] || is_asking || { echo "现在没有确认框，没按（$NAME $( is_busy && echo 在干活 || echo 空闲 )）"; exit 1 }
+    for k in "$@"; do screen -S "$S" -p 0 -X stuff "$(keycode "$k")"; sleep 0.3; done
+    # Kimi 答完提问还有一屏「Ready to submit your answers?」，主人已经选过了，直接提交
+    [[ $AG == kimi ]] && { sleep 0.5; snap | grep -q 'Ready to submit' && screen -S "$S" -p 0 -X stuff '1' }
+    echo "已按：$*"
+    (( nowait )) && exit 0
+    sleep 1
+    wait_done 600 "$(cat "$TMP/since" 2>/dev/null)" ;;
+  wait)  need; wait_done "${2:-600}" "$(cat "$TMP/since" 2>/dev/null)" ;;
+  reply)
+    if [[ $2 == -v ]]; then get_reply "" "${3:-1}" v; else get_reply "" "${2:-1}"; fi ;;
+  ctx)   need; [[ $AG == kimi ]] && kimi_pct || get_reply "" 1 ctx ;;
+  jj)    need; wait_ready && do_jj "${2:-600}" ;;
   cl)
+    [[ $AG == claude ]] || { echo "gbc cl 只对 Claude 会话有用"; exit 1 }
     [[ $GBC_CL == 1 ]] || { echo "没装切号工具（多号接力的 /cla /clb），gbc cl 不可用；装了在 $CONF 里设 GBC_CL=1"; exit 1 }
     need; acct=${2:l}; mode=$3
     [[ $acct == [a-z] && ( -z $mode || $mode == jj ) ]] || { echo "用法：gbc cl A [jj]"; exit 1 }
@@ -231,42 +397,65 @@ case $1 in
     sleep 4; wait_ready || exit 1
     rm -f "$TMP/file"
     echo "已切到 ${(U)acct} 号新对话"
-    [[ $mode == jj ]] && exec "$0" send "$clip" "${4:-120}" ;;
-  busy)  need; is_busy && echo yes || echo no ;;
+    [[ $mode == jj ]] && exec "$0" send "$clip" "${4:-600}" ;;
+  busy)  need; if is_asking; then echo ask; elif is_busy; then echo yes; else echo no; fi ;;
+  ls)
+    found=0
+    for s in ${(f)"$(screen -ls 2>/dev/null | grep -oE '[0-9]+\.gb[^[:space:]]*' | sed 's/^[0-9]*\.//')"}; do
+      [[ -z $s ]] && continue; found=1; GBC_SESSION=$s "$0" _status
+    done
+    (( found )) || echo "没有开着的 gb 会话" ;;
+  _status)
+    need
+    if is_asking; then st=在等人选; elif is_busy; then st=在干活; elif is_ready; then st=空闲; else st=没就绪; fi
+    pct=$( [[ $AG == kimi ]] && kimi_pct || get_reply "" 1 ctx 2>/dev/null )
+    echo "$S  $NAME  $DIR  $st  上下文 ${pct:-?}%" ;;
   esc)   need; screen -S "$S" -p 0 -X stuff $'\e'; echo "已按 Esc" ;;
   show)  need; show_window ;;
   close) need; screen -S "$S" -X quit; rm -rf "$TMP"; echo "已结束 $S" ;;
   version) echo "gbc $GBC_VERSION" ;;
   doctor)
-    bad=0
+    bad=0 have=()
     chk() { if eval "$2" >/dev/null 2>&1; then echo "✅ $1"; else echo "❌ $1 —— $3"; bad=1; fi }
-    echo "gbc $GBC_VERSION，配置文件：$([[ -f $CONF ]] && echo $CONF || echo 没有，全用默认值)"
+    echo "gbc $GBC_VERSION，配置文件：$([[ -f $CONF ]] && echo $CONF || echo 没有，全用默认值)；默认后端 ${GBC_AGENT:-claude}"
     chk "screen" "command -v screen" "macOS 自带；找不到就 brew install screen"
     chk "python3" "command -v python3" "装命令行工具：xcode-select --install"
-    l=${GBC_LAUNCH:-claude}
-    chk "启动命令 $l" "env $CLEAN_ENV zsh -ic 'whence ${l%% *}'" "先装 Claude Code（npm install -g @anthropic-ai/claude-code）；用别的启动命令就设 GBC_LAUNCH"
-    chk "对话记录目录 $GBC_PROJECTS" "[[ -d $GBC_PROJECTS ]]" "先手动跑一次 claude；记录不在默认位置就设 GBC_PROJECTS"
     chk "能控制 Terminal" "osascript -e 'tell application \"Terminal\" to count windows'" "系统设置 → 隐私与安全性 → 自动化，允许它控制「终端」"
-    if [[ -n $GBC_JJ_CMD ]]; then chk "交接脚本 $GBC_JJ_CMD" "[[ -x ${~GBC_JJ_CMD} ]]" "路径不对，或者删掉 GBC_JJ_CMD 改用内置交接"
-    else echo "✅ 交接：内置（让 Claude 自己写到 ${GBC_HANDOFF_DIR:-~/交接}）"; fi
-    [[ $GBC_CL == 1 ]] && echo "✅ 切号：gbc cl 可用" || echo "ℹ️  切号：没开（GBC_CL 不是 1），额度用完只能等恢复"
-    echo "ℹ️  上下文窗口按 ${GBC_CTX_WINDOW:-1000000} token 算，到 ${GBC_CTX_LIMIT:-28}% 自动交接；模型窗口是 20 万的要设 GBC_CTX_WINDOW=200000"
+    l=${GBC_LAUNCH:-claude}
+    if env $CLEAN_ENV zsh -ic "whence ${l%% *}" >/dev/null 2>&1; then
+      have+=claude; echo "✅ Claude Code：启动命令 $l"
+      chk "  Claude 对话记录目录 $GBC_PROJECTS" "[[ -d $GBC_PROJECTS ]]" "先手动跑一次 claude；记录不在默认位置就设 GBC_PROJECTS"
+      if [[ -n $GBC_JJ_CMD ]]; then chk "  交接脚本 $GBC_JJ_CMD" "[[ -x ${~GBC_JJ_CMD} ]]" "路径不对，或者删掉 GBC_JJ_CMD 改用内置交接"
+      else echo "✅   交接：内置（让 Claude 自己写到 ${GBC_HANDOFF_DIR:-~/交接}）"; fi
+      [[ $GBC_CL == 1 ]] && echo "✅   切号：gbc cl 可用" || echo "ℹ️    切号：没开（GBC_CL 不是 1），额度用完只能等恢复"
+      echo "ℹ️    上下文窗口按 ${GBC_CTX_WINDOW:-1000000} token 算，到 ${GBC_CTX_LIMIT:-28}% 自动交接；模型窗口是 20 万的要设 GBC_CTX_WINDOW=200000"
+    else echo "ℹ️  Claude Code：没装（启动命令 $l 找不到）。要用就 npm install -g @anthropic-ai/claude-code"; fi
+    k=${GBC_KIMI_LAUNCH:-kimi}
+    if env $CLEAN_ENV zsh -ic "whence ${k%% *}" >/dev/null 2>&1; then
+      have+=kimi; echo "✅ Kimi Code：启动命令 $k，版本 $(env $CLEAN_ENV zsh -ic "${k%% *} --version" 2>/dev/null | tail -1)"
+      chk "  Kimi 数据目录 $GBC_KIMI_HOME" "[[ -d $GBC_KIMI_HOME ]]" "先手动跑一次 kimi 并登录；数据不在默认位置就设 GBC_KIMI_HOME"
+      echo "ℹ️    Kimi 启动时会自动升级，界面变了 gbc 可能认不出忙闲；收发以对话记录为准，出问题先跑 gbc doctor --full"
+    else echo "ℹ️  Kimi Code：没装（启动命令 $k 找不到）"; fi
+    (( ${#have} )) || { echo "❌ Claude Code 和 Kimi Code 一个都没装，至少装一个"; bad=1 }
+    (( ${#have} )) && [[ ${have[(I)${GBC_AGENT:-claude}]} == 0 ]] && echo "⚠️  默认后端 ${GBC_AGENT:-claude} 没装，在 $CONF 里写 : \${GBC_AGENT=${have[1]}}"
     sl=$(pmset -g 2>/dev/null | awk '$1=="sleep"{print $2}')
     [[ $sl == 0 ]] && echo "✅ 插电不睡眠" || echo "⚠️  插电 ${sl} 分钟后会睡，睡着时 Grok Bot 连不上这台 Mac：系统设置里关掉自动睡眠，或常开 caffeinate -s"
     if [[ $2 == --full ]] && (( ! bad )); then
-      echo "—— 实测一轮（临时会话 gbc-doctor，在 ~/Documents 开，会弹一个终端窗口，约 1 分钟）——"
-      export GBC_SESSION=gbc-doctor GBC_AUTO_JJ=0
-      sf=${TMPDIR:-/tmp}/gbc-doctor.seen; rm -f "$sf"
-      "$0" close >/dev/null 2>&1
-      "$0" open "$HOME/Documents" || { echo "❌ 会话没开起来，到弹出的终端窗口看卡在哪（首次用要先登录 Claude、信任目录）"; exit 1 }
-      ( for i in {1..240}; do [[ $("$0" busy 2>/dev/null) == yes ]] && { touch "$sf"; break }; sleep 0.25; done ) &
-      out=$("$0" send "从 1 数到 30，用逗号隔开，只回这串数字，不要用任何工具。" 120)
-      kill $! 2>/dev/null; wait $! 2>/dev/null; seen=no; [[ -f $sf ]] && seen=yes; rm -f "$sf"
-      [[ $out == *30* ]] && echo "✅ 收发：拿回了 Claude 的回复" || { echo "❌ 收发：没拿到回复，输出如下"; print -r -- "$out"; bad=1 }
-      [[ $seen == yes ]] && echo "✅ 忙闲识别：认出了 Claude 在干活" || echo "⚠️  忙闲识别：没认出「在干活」，Claude Code 可能改了界面；收发仍以对话记录为准"
-      "$0" close >/dev/null
+      for a in $have; do
+        ds=gbc-doctor-$a
+        echo "—— 实测 $a 一轮（临时会话 $ds，在 ${GBC_DOCTOR_DIR:-$HOME/Documents} 开，会弹一个终端窗口，约 1 分钟）——"
+        sf=${TMPDIR:-/tmp}/$ds.seen; rm -f "$sf"
+        GBC_SESSION=$ds "$0" --$a close >/dev/null 2>&1
+        GBC_SESSION=$ds GBC_AUTO_JJ=0 "$0" open --$a "${GBC_DOCTOR_DIR:-$HOME/Documents}" || { echo "❌ $a 会话没开起来，到弹出的终端窗口看卡在哪（首次用要先登录、信任目录）"; GBC_SESSION=$ds "$0" close >/dev/null; bad=1; continue }
+        ( for i in {1..240}; do [[ $(GBC_SESSION=$ds "$0" busy 2>/dev/null) == yes ]] && { touch "$sf"; break }; sleep 0.25; done ) &
+        out=$(GBC_SESSION=$ds GBC_AUTO_JJ=0 "$0" send "从 1 数到 30，用逗号隔开，只回这串数字，不要用任何工具。" 120)
+        kill $! 2>/dev/null; wait $! 2>/dev/null; seen=no; [[ -f $sf ]] && seen=yes; rm -f "$sf"
+        [[ $out == *30* ]] && echo "✅ $a 收发：拿回了回复" || { echo "❌ $a 收发：没拿到回复，输出如下"; print -r -- "$out"; bad=1 }
+        [[ $seen == yes ]] && echo "✅ $a 忙闲识别：认出了在干活" || echo "⚠️  $a 忙闲识别：没认出「在干活」，界面可能改了；收发仍以对话记录为准"
+        GBC_SESSION=$ds "$0" close >/dev/null
+      done
     fi
     (( bad )) && { echo "有 ❌ 的先按提示修，修完再跑 gbc doctor"; exit 1 }
-    echo "都好了。下一步：gbc open <目录>，再 gbc send \"任务\"" ;;
+    echo "都好了。下一步：gbc open <目录>（Kimi 用 gbc open --kimi <目录>），再 gbc send \"任务\"" ;;
   *) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac
